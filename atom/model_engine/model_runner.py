@@ -1029,6 +1029,13 @@ class ModelRunner:
                 ),
             )
             apply_simulated_tp(config)
+        # GEMM fusion: no-op unless config.gemm_fusion.profile is set. Needs the
+        # SP group, so it runs after distributed init and before model build.
+        if config.gemm_fusion.enabled:
+            from atom.distributed.ulysses_sp import get_sp_group
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.init_gemm_fusion(config, get_sp_group())
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
@@ -1077,6 +1084,10 @@ class ModelRunner:
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
+        if self.config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.shutdown()  # before the dist env its windows live on
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()
@@ -2158,6 +2169,10 @@ class ModelRunner:
             transfer_tensors,
             num_blocks=num_kvcache_blocks,
         )
+        if config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.bind_kv_cache(kv_cache_data)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -4149,6 +4164,22 @@ class ModelRunner:
                 self.h2d_owner.fail()
                 raise
 
+        if self.config.gemm_fusion.enabled:
+            # Resolve (and agree on) every bucket on every rank before capture
+            # so no collective is introduced during capture or replay.
+            from atom.distributed.ulysses_sp import sp_pad_len
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.before_graph_capture(
+                sorted(
+                    {
+                        sp_pad_len(bs * q_len)
+                        for q_len in q_buckets
+                        for bs in self.capture_sizes
+                    }
+                )
+            )
+
         with (
             pause_gc(),
             graph_capture() as capture_ctx,
@@ -4334,6 +4365,10 @@ class ModelRunner:
                     ),
                     capture_ctx.stream,
                 )
+        if self.config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.after_graph_capture()
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
 

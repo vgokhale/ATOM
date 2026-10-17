@@ -13,6 +13,7 @@ from atom.config import (
     DCPConfig,
     DSparkConfig,
     EPLBConfig,
+    GemmFusionConfig,
     ParallelConfig,
     SpeculativeConfig,
 )
@@ -165,6 +166,7 @@ class EngineArgs:
     online_quant_config: dict | None = None
     hf_overrides: dict | None = None
     dspark_config: dict | None = None
+    gemm_fusion_profile: str | None = None
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -649,6 +651,15 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--gemm-fusion-profile",
+            type=str,
+            default=None,
+            help=(
+                "Name of an aiter GEMM-fusion profile (aiter/configs/gemm_fusion/"
+                "<name>.json). Unset/empty (default) disables GEMM fusion."
+            ),
+        )
+        parser.add_argument(
             "--dspark-config",
             type=json.loads,
             default=None,
@@ -825,6 +836,10 @@ class EngineArgs:
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
         kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
+        # --gemm-fusion-profile (name) -> Config.gemm_fusion; empty = OFF.
+        kwargs["gemm_fusion"] = GemmFusionConfig(
+            profile=kwargs.pop("gemm_fusion_profile", None) or ""
+        )
         # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
         # is the master switch, --eplb-config only tunes it).
         kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))
