@@ -4204,7 +4204,6 @@ class ModelRunner:
                         for bs in self.capture_sizes
                     }
                 ),
-                device=self.device,
             )
 
         with (
