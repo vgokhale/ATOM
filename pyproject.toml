@@ -40,6 +40,7 @@ include-package-data = true
 atom = [
     "mesh/target/release/libmesh.so",
     "benchmarks/results/schemas/*.json",
+    "models/deepseek_v4_mono/configs/*.json",
 ]
 
 [project.entry-points."vllm.platform_plugins"]

@@ -486,6 +486,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
+    # Opt-in gfx1250 regional hybrid for measured V4 Flash TP1 / Pro TP4.
+    "ATOM_DSV4_MONO": lambda: os.getenv("ATOM_DSV4_MONO", "0") == "1",
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built

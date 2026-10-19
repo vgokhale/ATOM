@@ -592,3 +592,11 @@ Set on the decode side; the prefill side follows what each write request offers 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_PD_MLA_LANDING** | bool | 1 | Decode (`kv_consumer`, plain `mooncake` connector, DCP > 1, a plain MLA model) only. Allocate a GPU landing pool per rank and give prefill stages partitions of it. A stage writes a rank's MLA rows packed in rank order into a landing slot with one RDMA descriptor per slot (instead of one per destination page); the decode rank scatters the slot into its paged KV cache on a side stream and returns the slot. A request completes only after its slots are scattered. Destination bytes are identical to the staged path. The pool is 256 MiB of 8 MiB slots per decode rank; it and the scatter's segment table (about 12 MiB at block size 1, less for larger blocks) are held back from the KV cache budget. Only a non-DCP MLA prefill with `ATOM_PD_MLA_STAGING=1` lands, so set 0 where none does (for example symmetric DCP P/D) to give the pool back to the KV cache. Partitions go first come, first served: a prefill stage endpoint gets `32 // its PP size` slots on first contact and keeps them while the decode runs, so with several prefill instances per decode rank a later one may get fewer slots, or none and keep the staged path. A stage that reports it cannot land returns its partition at its first write-done and is not offered slots again. A prefill sends a transfer needing fewer than 2 slots, or the rest of one after waiting 10 ms for a free slot, through the staged per-page path. 0 keeps the staged per-page writes. |
+
+### DeepSeek V4 gfx1250 regional hybrid
+
+`ATOM_DSV4_MONO=1` opts into Flash TP1 / Pro TP4 regional hybrid decode through
+the shared mono post-load installer. Default: `0`. Also requires
+`ATOM_MONO_ENABLE=1`. Unsupported deployments and steps use the native model.
+`ATOM_MONO_CHECK=1` enables exact regional comparisons outside graph capture.
+See [the gfx1250 V4 integration guide](deepseek_v4_gfx1250_mono.md).

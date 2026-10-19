@@ -2893,6 +2893,8 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         run_indexer_proj: bool = True,
+        x_quant: torch.Tensor | None = None,
+        x_scale: torch.Tensor | None = None,
     ):
         """Graphable projection/norm prelude shared by both attention paths.
 
@@ -2912,7 +2914,9 @@ class DeepseekV4Attention(nn.Module):
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
 
-        qkv_a = self.wqkv_a(x)
+        qkv_a = (
+            self.wqkv_a(x) if x_quant is None else self.wqkv_a(x_quant, x_scale=x_scale)
+        )
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
         assert (
             not _V4_FORCE_UE8M0_QUANT
@@ -3064,6 +3068,8 @@ class DeepseekV4Attention(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+        x_quant: torch.Tensor | None = None,
+        x_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]  BF16 attention output
         """Compute attention for `x` at absolute token `positions`.
 
@@ -3105,7 +3111,7 @@ class DeepseekV4Attention(nn.Module):
         # FULL order: compressor launch overlaps projections, then inline
         # QK-norm/RoPE, compressor join, paged core, and output projection.
         q, kv_pre, qr, qr_scale, hidden, *_ = self._attn_pre(
-            x, positions, run_indexer_proj=False
+            x, positions, run_indexer_proj=False, x_quant=x_quant, x_scale=x_scale
         )
         qkn = self._qk_norm_rope(q, kv_pre, positions)
         self._attn_compress(
