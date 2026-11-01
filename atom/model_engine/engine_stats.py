@@ -562,7 +562,9 @@ class EngineStats:
                 f"free {occ['free']} ({occ['free'] / total:.0%}), "
                 f"retained-cache {occ['retained']}, "
                 f"evicted this interval {evicted_iv} "
-                f"(total {occ['evicted_total']})"
+                f"(total {occ['evicted_total']}), "
+                f"state images {occ.get('images', 0)} "
+                f"({occ.get('image_units', 0)} units)"
             )
             # Rejected chains are rehashed on the scheduler thread.
             bm = self.block_manager

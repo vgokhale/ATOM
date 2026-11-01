@@ -947,6 +947,15 @@ class BlockManager:
         used = self.kv.num_used
         free = self.kv.num_free
         hashed = self.kv.num_indexed
+        # PAGE state checkpoint images live in the same pool: count what they
+        # hold, so `used` can be told apart into images and request KV.
+        psc = self.paged_state_checkpoints
+        images = len(psc.store.records) if psc is not None else 0
+        image_units = (
+            sum(len(r.unit_ids) for r in psc.store.records.values())
+            if psc is not None
+            else 0
+        )
         return {
             "used": used,
             "free": free,
@@ -954,6 +963,8 @@ class BlockManager:
             "hashed": hashed,
             "retained": max(0, hashed - used),
             "evicted_total": self.total_evicted_blocks,
+            "images": images,
+            "image_units": image_units,
         }
 
     def _joint_kv_boundary(

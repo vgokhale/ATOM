@@ -14,10 +14,17 @@ from time import monotonic
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+from atom.utils import envs
 
 _CHANGE_LOG_LIMIT = 4096
 
 logger = logging.getLogger("atom")
+
+
+def _release_any(_prefix_hash: int) -> bool:
+    """A GPU-only image budget may release any eligible image."""
+    return True
+
 
 #: How many reclaimed store operations to remember. Only has to outlive a
 #: report already on the wire, which is one step, so this is generous.
@@ -378,18 +385,20 @@ class PageUnitCheckpointStore:
             layout_id=self.spec.layout_id,
         )
 
-    def trim_offloaded(
-        self, max_entries: int, can_serve: Callable[[int], bool]
+    def trim_to_budget(
+        self, max_entries: int, can_release: Callable[[int], bool]
     ) -> None:
-        """Release old GPU images backed by the tier, without touching live DMA.
+        """Release the oldest GPU images past `max_entries`, never live DMA.
 
         The pool's free list includes cached KV. Waiting for it to empty lets
-        checkpoint images displace reusable KV even after those images were
-        stored on CPU. This optional soft budget spends only unpinned READY
-        images whose successful store is still advertised by the tier. Copies,
+        checkpoint images displace reusable KV. This soft budget spends only
+        unpinned READY images, least recently used first, and of those only
+        the ones `can_release` allows: with the CPU tier, those whose
+        successful store the tier still advertises; without it, any. Copies,
         restores and unconfirmed stores may temporarily exceed the budget.
-        A later CPU eviction is handled by the existing failed-load/recompute
-        path; tier membership is optimistic, just as for ordinary eviction.
+        A released image a later prefix would have resumed from costs that
+        prefix a recompute from an earlier boundary, as ordinary eviction does
+        (and, with the tier, a load when it still holds the image).
         """
         if max_entries <= 0 or len(self.records) <= max_entries:
             return
@@ -397,7 +406,7 @@ class PageUnitCheckpointStore:
             if len(self.records) <= max_entries:
                 break
             record = self.records[checkpoint_id]
-            if self._is_evictable(checkpoint_id) and can_serve(record.prefix_hash):
+            if self._is_evictable(checkpoint_id) and can_release(record.prefix_hash):
                 self._evict(checkpoint_id)
 
     def restore_queued_for(self, dst_slot: int) -> bool:
@@ -970,6 +979,29 @@ class PagedStateCheckpointCoordinator:
         self.store = PageUnitCheckpointStore(
             pool, spec, offload_sink=offload is not None
         )
+        # GPU-only budget for the images (ATOM_STATE_CHECKPOINT_GPU_SIZE): past
+        # it, `complete_previous_batch` releases the least recently used ones
+        # rather than letting them displace the prefix cache. A conversation
+        # resumes from its newest image, so the ones that age out are the
+        # superseded ones; a shared prefix's image stays recent by being hit.
+        self._gpu_max_entries = 0
+        budget = envs.ATOM_STATE_CHECKPOINT_GPU_SIZE
+        if enabled and budget:
+            if not 0 < budget < float("inf"):
+                raise ValueError(
+                    "ATOM_STATE_CHECKPOINT_GPU_SIZE must be finite and nonnegative"
+                )
+            entry_bytes = self.store.units_per_checkpoint * spec.page_unit_bytes
+            self._gpu_max_entries = int(budget * (1 << 30)) // entry_bytes
+            if self._gpu_max_entries < 1:
+                raise ValueError(
+                    "ATOM_STATE_CHECKPOINT_GPU_SIZE must fit one checkpoint"
+                )
+            logger.info(
+                "state checkpoints: GPU image budget %.2f GiB (%d images)",
+                budget,
+                self._gpu_max_entries,
+            )
         # Keyed by `(seq id, prefix hash)` rather than by seq: two boundaries of
         # one prompt are two checkpoints, and keying by seq alone let the later
         # one overwrite the earlier before either was stored. Re-reaching the
@@ -1201,9 +1233,11 @@ class PagedStateCheckpointCoordinator:
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
         if self._offload_gpu_max_entries and self.offload is not None:
-            self.store.trim_offloaded(
+            self.store.trim_to_budget(
                 self._offload_gpu_max_entries, self.offload.could_serve
             )
+        elif self._gpu_max_entries:
+            self.store.trim_to_budget(self._gpu_max_entries, _release_any)
         # The batch that carried these stores has been issued.
         issued, self._scratch_issued = self._scratch_issued, []
         for slot in issued:

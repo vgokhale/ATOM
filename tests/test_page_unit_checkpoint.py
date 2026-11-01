@@ -51,7 +51,7 @@ def test_offload_budget_releases_old_images_without_spending_cached_kv():
     ready(store, 22)
     ready(store, 33)
     before = pool.num_free
-    store.trim_offloaded(2, lambda h: True)
+    store.trim_to_budget(2, lambda h: True)
     assert not store.contains(11)
     assert store.contains(22) and store.contains(33)
     assert pool.num_free == before + store.units_per_checkpoint
@@ -67,12 +67,12 @@ def test_offload_budget_preserves_unconfirmed_and_pinned_sources():
     # A restore owns 22; an external reader owns 33.
     assert store.begin_restore(22, 0)
     op, _ = store.acquire_checkpoint_source(33)
-    store.trim_offloaded(1, lambda h: h != 11)
+    store.trim_to_budget(1, lambda h: h != 11)
     assert store.contains(11) and store.contains(22) and store.contains(33)
     assert not store.contains(44)
     store.release_offload_store_source(op)
     store.settle_offload_store(op)
-    store.trim_offloaded(1, lambda h: h != 11)
+    store.trim_to_budget(1, lambda h: h != 11)
     assert not store.contains(33)
     assert store.contains(22)
 
@@ -81,7 +81,7 @@ def test_offload_budget_never_releases_an_inflight_gpu_writer():
     _pool, store = make_store()
     store.begin_store(11, 0)
     store.begin_store(22, 0)
-    store.trim_offloaded(1, lambda h: True)
+    store.trim_to_budget(1, lambda h: True)
     assert len(store.records) == 2
     assert all(record.state == COPYING for record in store.records.values())
 
@@ -104,6 +104,47 @@ def test_offload_gpu_budget_is_opt_in_and_counts_page_padding(monkeypatch):
     assert c.offload.could_serve(11)
     # Removing the GPU image must not remove the tier's resumable boundary.
     assert c.resumable_hit(TestTheTierVotes.seq(), 1, [11]) == 1
+
+
+def test_gpu_image_budget_is_opt_in_and_needs_no_tier(monkeypatch):
+    monkeypatch.delenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", raising=False)
+    c = TestTheTierVotes.coordinator()
+    assert c._gpu_max_entries == 0
+    # A 25-byte image needs 30 physical bytes: 80 bytes permit two, not three.
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    assert c._gpu_max_entries == 2
+    assert c.offload is None
+    for h in (11, 22, 33):
+        ready(c.store, h)
+    c.complete_previous_batch()
+    # the least recently used image goes; the two newest stay on the GPU
+    assert not c.store.contains(11)
+    assert c.store.contains(22) and c.store.contains(33)
+
+
+def test_gpu_image_budget_keeps_a_hit_image(monkeypatch):
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    for h in (11, 22):
+        ready(c.store, h)
+    # a restore from 11 makes it the most recently used; once it lands, its pin
+    # is gone, so recency alone keeps it
+    assert c.store.begin_restore(11, 0)
+    c.store.take_restore_ops()
+    c.store.complete_inflight()
+    rid = next(cid for cid, r in c.store.records.items() if r.prefix_hash == 11)
+    assert c.store.records[rid].pin_count == 0
+    ready(c.store, 33)
+    c.complete_previous_batch()
+    assert c.store.contains(11) and c.store.contains(33)
+    assert not c.store.contains(22)
+
+
+def test_gpu_image_budget_must_fit_one_image(monkeypatch):
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(10 / (1 << 30)))
+    with pytest.raises(ValueError, match="must fit one checkpoint"):
+        TestTheTierVotes.coordinator()
 
 
 @pytest.mark.parametrize("can_load,sink", [(False, True), (True, False)])
