@@ -1260,6 +1260,15 @@ class BlockManager:
             live_blocks=num_new_blocks,
             protected_hash=protected_hash,
         )
+        psc = self.paged_state_checkpoints
+        if psc is not None and psc.diag:
+            seq.short_resume_kind = (
+                psc.classify_shortfall(
+                    block_hashes, resumable, seq.num_wanted_hit_blocks
+                )
+                if seq.num_wanted_hit_blocks > resumable
+                else None
+            )
         self._record_checkpoint_end(seq)
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1

@@ -471,6 +471,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_GPU_SIZE": lambda: float(
         os.getenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", "0")
     ),
+    # Log `[Image Diag]` each stats interval: how state checkpoint images were
+    # released, and which kind a resume short of its KV frontier needed.
+    "ATOM_STATE_CHECKPOINT_DIAG": lambda: os.getenv("ATOM_STATE_CHECKPOINT_DIAG", "0")
+    == "1",
     # vLLM plugin, state checkpoints: overrides the native checkpoint interval
     # (tokens; 0 = publish no state checkpoint, -1 = no rungs, anchor and demand only).
     # Unset: the model's native default.

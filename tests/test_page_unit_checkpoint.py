@@ -891,3 +891,34 @@ class TestTheTierVotes:
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 2
         index.hashes.discard(77)  # what `fail_load` -> `forget` does
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 0
+
+
+def test_diag_names_the_released_image_a_short_resume_needed(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DIAG", "1")
+    c = TestTheTierVotes.coordinator()
+    s = SimpleNamespace(
+        has_per_req_cache=True, state_slot=0, block_size=1, num_prompt_tokens=10
+    )
+    ready(c.store, 11)
+    c.checkpoint(s, 10, 22)  # prompt-end image
+    ready(c.store, 22)
+    c.checkpoint(s, 15, 33)  # decode-time image, released first
+    ready(c.store, 33)
+    c.complete_previous_batch()
+    assert c.diag_released == {"budget:decode": 1}
+    # a resume found image 22 at boundary 2 but its KV ran to boundary 4,
+    # where the released 33 sat; boundary 3's hash was never imaged
+    assert c.classify_shortfall([11, 22, 44, 33, 55], 2, 4) == "budget:decode@<10s"
+    assert c.classify_shortfall([11, 22, 44, 66, 55], 2, 4) == "never"
+    c.note_shortfall("budget:decode", 128)
+    assert "budget:decode 1/128" in c.diag_line()
+    assert "budget:decode 1 |" in c.diag_line()
+
+
+def test_diag_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("ATOM_STATE_CHECKPOINT_DIAG", raising=False)
+    c = TestTheTierVotes.coordinator()
+    assert not c.diag and c.store.on_evict is None

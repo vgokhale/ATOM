@@ -207,6 +207,9 @@ class PageUnitCheckpointStore:
         self._inflight_restores: list[int] = []
         self._next_checkpoint_id = 0
         self.evictions = 0
+        # Diagnostics (ATOM_STATE_CHECKPOINT_DIAG): told of every image released,
+        # with whether `unindex` (its prefix left the KV index) released it.
+        self.on_evict: Callable[[CheckpointRecord, bool], None] | None = None
         # Checkpoints that reached READY and have not been offered to the CPU
         # tier yet. Candidates only: NOT pinned, so one still counts as free
         # space and `_next_victim` may spend it. The pin is taken later, in
@@ -903,6 +906,8 @@ class PageUnitCheckpointStore:
         record = self.records.get(checkpoint_id)
         if record is None:
             return False
+        if self.on_evict is not None and record.state == READY:
+            self.on_evict(record, True)
         record.state = EVICTING
         self._lru.pop(checkpoint_id, None)
         # Keep units alive while a queued GPU writer can still access them.
@@ -926,6 +931,8 @@ class PageUnitCheckpointStore:
         record = self.records[checkpoint_id]
         if record.state != READY or record.pin_count:
             raise AssertionError("only an unpinned READY checkpoint is evictable")
+        if self.on_evict is not None:
+            self.on_evict(record, False)
         self._note_change(record.prefix_hash)
         if self.hash_to_checkpoint.get(record.prefix_hash) == checkpoint_id:
             del self.hash_to_checkpoint[record.prefix_hash]
@@ -1017,6 +1024,18 @@ class PagedStateCheckpointCoordinator:
         self.store = PageUnitCheckpointStore(
             pool, spec, offload_sink=offload is not None
         )
+        # ATOM_STATE_CHECKPOINT_DIAG: what kind of image each release was, and
+        # for a resume that fell short of its KV frontier, the kind of the
+        # nearest released image that would have served it ("never" when no
+        # image ever existed between the two).
+        self.diag = envs.ATOM_STATE_CHECKPOINT_DIAG and enabled
+        self._decode_hashes: set[int] = set()
+        self._released_kind: OrderedDict[int, tuple[str, float]] = OrderedDict()
+        self._trimming = False
+        self.diag_released: dict[str, int] = {}
+        self.diag_short: dict[str, list[int]] = {}
+        if self.diag:
+            self.store.on_evict = self._note_release
         # GPU-only budget for the images (ATOM_STATE_CHECKPOINT_GPU_SIZE): past
         # it, `complete_previous_batch` releases the least recently used ones
         # rather than letting them displace the prefix cache. A conversation
@@ -1225,6 +1244,8 @@ class PagedStateCheckpointCoordinator:
                 # so the next turn diverges before it and resumes at the
                 # prompt-end image. This image goes first under a budget.
                 self._release_first.add(h)
+                if self.diag:
+                    self._decode_hashes.add(h)
 
     def _supersede(self, seq_id: int) -> None:
         """Drop this seq's earlier pending boundaries; the slot has moved on.
@@ -1290,6 +1311,60 @@ class PagedStateCheckpointCoordinator:
         stores, self._store_ops = self._store_ops, []
         return tuple(stores), restores
 
+    def _note_release(self, record: CheckpointRecord, unindexed: bool) -> None:
+        h = record.prefix_hash
+        if h in self._decode_hashes:
+            kind = "decode"
+            self._decode_hashes.discard(h)
+        elif record.superseded:
+            kind = "superseded"
+        elif record.restores > 1:
+            kind = "shared"
+        elif record.restores:
+            kind = "restored"
+        else:
+            kind = "unread"
+        source = "unindex" if unindexed else "budget" if self._trimming else "pressure"
+        key = f"{source}:{kind}"
+        self.diag_released[key] = self.diag_released.get(key, 0) + 1
+        self._released_kind[h] = (key, monotonic())
+        self._released_kind.move_to_end(h)
+        if len(self._released_kind) > 1 << 17:
+            self._released_kind.popitem(last=False)
+
+    def classify_shortfall(self, block_hashes: list[int], hit: int, wanted: int) -> str:
+        """How the image nearest below boundary `wanted`, above `hit`, went,
+        and how long before this resume it was released."""
+        for b in range(min(wanted, len(block_hashes)), hit, -1):
+            released = self._released_kind.get(block_hashes[b - 1])
+            if released is not None:
+                key, at = released
+                age = monotonic() - at
+                bucket = next(
+                    (f"<{t}s" for t in (10, 30, 60, 120, 300) if age < t), ">300s"
+                )
+                return f"{key}@{bucket}"
+        return "never"
+
+    def note_shortfall(self, kind: str, tokens: int) -> None:
+        n = self.diag_short.setdefault(kind, [0, 0])
+        n[0] += 1
+        n[1] += tokens
+
+    def diag_line(self) -> str:
+        records = self.store.records.values()
+        superseded = sum(r.superseded for r in records)
+        shared = sum(r.restores > 1 for r in records)
+        released = ", ".join(f"{k} {v}" for k, v in sorted(self.diag_released.items()))
+        short = ", ".join(
+            f"{k} {n}/{t}" for k, (n, t) in sorted(self.diag_short.items())
+        )
+        return (
+            f"images {len(self.store.records)} (superseded {superseded}, "
+            f"shared {shared}) | released: {released} | "
+            f"short resumes (reqs/tokens): {short}"
+        )
+
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
         for h in list(self._release_first):
@@ -1303,7 +1378,9 @@ class PagedStateCheckpointCoordinator:
                 self._offload_gpu_max_entries, self.offload.could_serve
             )
         elif self._gpu_max_entries:
+            self._trimming = True
             self.store.trim_to_budget(self._gpu_max_entries, _release_any)
+            self._trimming = False
         # The batch that carried these stores has been issued.
         issued, self._scratch_issued = self._scratch_issued, []
         for slot in issued:
