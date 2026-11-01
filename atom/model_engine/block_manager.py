@@ -1733,7 +1733,9 @@ class BlockManager:
             seq.state_fork_src = -1
             if hit_hash == -1:
                 return True  # cold start: nothing claimed, nothing to restore
-            if self.paged_state_checkpoints.begin_restore(hit_hash, seq.state_slot):
+            if self.paged_state_checkpoints.begin_restore(
+                hit_hash, seq.state_slot, seq=seq
+            ):
                 # Queued for the next batch, which gathers the image out of its
                 # PAGE units into the committed slot. What the caller holds is
                 # what it asked for.

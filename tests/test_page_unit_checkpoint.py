@@ -141,6 +141,85 @@ def test_gpu_image_budget_keeps_a_hit_image(monkeypatch):
     assert not c.store.contains(22)
 
 
+def _image_seq(slot=0):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(has_per_req_cache=True, state_slot=slot)
+
+
+def test_budget_releases_superseded_images_before_older_live_ones(monkeypatch):
+    # room for two images (25 bytes each in 30 physical)
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    a, b = _image_seq(0), _image_seq(1)
+    ready(c.store, 11)  # conversation A's newest image, the oldest overall
+    c.checkpoint(b, 1, 22)
+    ready(c.store, 22)  # stored at the drain after it was filed
+    c.checkpoint(b, 2, 33)  # B moves on: its 22 is superseded
+    ready(c.store, 33)
+    c.complete_previous_batch()
+    # plain LRU would drop 11; the superseded 22 goes instead
+    assert c.store.contains(11) and c.store.contains(33)
+    assert not c.store.contains(22)
+    del a
+
+
+def test_the_image_a_turn_resumed_from_is_superseded_by_its_next(monkeypatch):
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    ready(c.store, 11)  # the previous turn's image, which this turn resumes from
+    ready(c.store, 22)  # another conversation's newest
+    nxt = _image_seq(3)
+    assert c.begin_restore(11, nxt.state_slot, seq=nxt)
+    c.store.take_restore_ops()
+    c.store.complete_inflight()
+    c.checkpoint(nxt, 4, 44)  # the new turn files its own boundary
+    ready(c.store, 44)
+    c.complete_previous_batch()
+    assert not c.store.contains(11)
+    assert c.store.contains(22) and c.store.contains(44)
+
+
+def test_a_decode_time_image_supersedes_nothing_and_goes_first(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    s = SimpleNamespace(
+        has_per_req_cache=True, state_slot=0, block_size=1, num_prompt_tokens=10
+    )
+    ready(c.store, 11)  # another conversation's newest, the oldest overall
+    c.checkpoint(s, 10, 22)  # this turn's prompt-end image: where its next turn resumes
+    ready(c.store, 22)
+    c.checkpoint(s, 15, 33)  # a decode-time image
+    ready(c.store, 33)
+    c.complete_previous_batch()
+    # the decode-time image goes, not the prompt-end one nor the oldest
+    assert c.store.contains(11) and c.store.contains(22)
+    assert not c.store.contains(33)
+
+
+def test_a_shared_image_is_never_superseded():
+    _pool, store = make_store(num_units=40)
+    ready(store, 11)
+    for slot in (0, 1):  # two conversations resume from the same prefix
+        assert store.begin_restore(11, slot)
+    store.take_restore_ops()
+    store.complete_inflight()
+    store.mark_superseded(11)
+    rid = next(cid for cid, r in store.records.items() if r.prefix_hash == 11)
+    assert not store.records[rid].superseded
+
+
+def test_forgetting_a_seq_drops_its_image_bookkeeping():
+    c = TestTheTierVotes.coordinator()
+    s = _image_seq(0)
+    c.checkpoint(s, 1, 22)
+    assert id(s) in c._seq_last_image
+    c.forget_pending(s)
+    assert id(s) not in c._seq_last_image and id(s) not in c._seq_resumed_from
+
+
 def test_gpu_image_budget_must_fit_one_image(monkeypatch):
     monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(10 / (1 << 30)))
     with pytest.raises(ValueError, match="must fit one checkpoint"):

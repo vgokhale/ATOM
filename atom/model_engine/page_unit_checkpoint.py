@@ -136,6 +136,13 @@ class CheckpointRecord:
     unit_ids: tuple[int, ...]
     state: str = COPYING
     pin_count: int = 0
+    # A later image of the same conversation exists: the seq that wrote this
+    # one filed a later boundary, or the next turn resumed from it and filed
+    # its own. A budget trim releases these first (`trim_to_budget`).
+    superseded: bool = False
+    # Restores served. More than one means several conversations resume here
+    # (a shared prefix), so nothing supersedes it.
+    restores: int = 0
 
 
 @dataclass(frozen=True)
@@ -402,12 +409,34 @@ class PageUnitCheckpointStore:
         """
         if max_entries <= 0 or len(self.records) <= max_entries:
             return
-        for checkpoint_id in list(self._lru):
-            if len(self.records) <= max_entries:
-                break
-            record = self.records[checkpoint_id]
-            if self._is_evictable(checkpoint_id) and can_release(record.prefix_hash):
-                self._evict(checkpoint_id)
+        # Superseded images first, then the rest; least recently used first in
+        # each. An image a live conversation will resume from is its newest,
+        # which nothing has superseded, so age alone does not release it while
+        # older generations of other conversations remain.
+        for superseded_only in (True, False):
+            for checkpoint_id in list(self._lru):
+                if len(self.records) <= max_entries:
+                    return
+                record = self.records.get(checkpoint_id)
+                if record is None or (superseded_only and not record.superseded):
+                    continue
+                if self._is_evictable(checkpoint_id) and can_release(
+                    record.prefix_hash
+                ):
+                    self._evict(checkpoint_id)
+
+    def mark_superseded(self, prefix_hash: int) -> None:
+        """Mark the image at `prefix_hash` as no longer a resume point.
+
+        Unless several conversations resume from it: a shared prefix's image
+        (the system prompt, say) stays an ordinary LRU candidate.
+        """
+        checkpoint_id = self.lookup(prefix_hash)
+        if checkpoint_id < 0:
+            return
+        record = self.records[checkpoint_id]
+        if record.restores <= 1:
+            record.superseded = True
 
     def restore_queued_for(self, dst_slot: int) -> bool:
         """Whether a queued restore will write `dst_slot` on the next batch."""
@@ -421,6 +450,7 @@ class PageUnitCheckpointStore:
             return None
         record = self.records[checkpoint_id]
         record.pin_count += 1
+        record.restores += 1
         self._lru.move_to_end(checkpoint_id)
         op = CheckpointRestoreOp(
             dst_slot=dst_slot,
@@ -976,6 +1006,14 @@ class PagedStateCheckpointCoordinator:
         # `resumable_hit` (the vote) and `take_offload_stores` (the sink).
         self.offload = offload
         self._offload_gpu_max_entries = 0
+        # Per live seq (by id): the last boundary it filed, and the image it
+        # resumed from. Both become superseded when the seq files a later
+        # boundary; dropped with the seq's slot (`forget_pending`).
+        self._seq_last_image: dict[int, int] = {}
+        self._seq_resumed_from: dict[int, int] = {}
+        # Decode-time boundaries filed but maybe not stored yet; marked
+        # superseded once their image exists (`complete_previous_batch`).
+        self._release_first: set[int] = set()
         self.store = PageUnitCheckpointStore(
             pool, spec, offload_sink=offload is not None
         )
@@ -1166,10 +1204,27 @@ class PagedStateCheckpointCoordinator:
         the bytes allow: the newer boundary is the one the slot actually holds,
         so it wins and the older is dropped rather than mis-stored.
         """
-        del boundary_blocks
         if self.applies(seq) and seq.state_slot >= 0:
             self._supersede(id(seq))
             self._pending[(id(seq), h)] = (seq, h)
+            pos = boundary_blocks * getattr(seq, "block_size", 0)
+            if pos <= getattr(seq, "num_prompt_tokens", pos):
+                # A prompt boundary: the next turn resumes at this prompt's end,
+                # so this seq's earlier prompt boundaries, and the image it
+                # resumed from, are no longer where the conversation resumes.
+                for older in (
+                    self._seq_last_image.get(id(seq)),
+                    self._seq_resumed_from.pop(id(seq), None),
+                ):
+                    if older is not None and older != h:
+                        self.store.mark_superseded(older)
+                self._seq_last_image[id(seq)] = h
+            else:
+                # A decode-time boundary supersedes nothing: the chat template
+                # rewrites this turn's tail when the next user turn is appended,
+                # so the next turn diverges before it and resumes at the
+                # prompt-end image. This image goes first under a budget.
+                self._release_first.add(h)
 
     def _supersede(self, seq_id: int) -> None:
         """Drop this seq's earlier pending boundaries; the slot has moved on.
@@ -1192,6 +1247,8 @@ class PagedStateCheckpointCoordinator:
         seq_id = id(seq)
         for key in [k for k in self._pending if k[0] == seq_id]:
             del self._pending[key]
+        self._seq_last_image.pop(seq_id, None)
+        self._seq_resumed_from.pop(seq_id, None)
         self.store.cancel_queued_restore(seq.state_slot)
 
     def restore_queued_for(self, dst_slot: int) -> bool:
@@ -1202,8 +1259,11 @@ class PagedStateCheckpointCoordinator:
         """
         return self.store.restore_queued_for(dst_slot)
 
-    def begin_restore(self, h: int, dst_slot: int) -> bool:
-        return self.store.begin_restore(h, dst_slot) is not None
+    def begin_restore(self, h: int, dst_slot: int, seq: Sequence | None = None) -> bool:
+        queued = self.store.begin_restore(h, dst_slot) is not None
+        if queued and seq is not None:
+            self._seq_resumed_from[id(seq)] = h
+        return queued
 
     def take_checkpoint_ops(
         self,
@@ -1232,6 +1292,12 @@ class PagedStateCheckpointCoordinator:
 
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
+        for h in list(self._release_first):
+            if self.store.contains(h):
+                self.store.mark_superseded(h)
+                self._release_first.discard(h)
+            elif not self.store.contains_or_pending(h):
+                self._release_first.discard(h)
         if self._offload_gpu_max_entries and self.offload is not None:
             self.store.trim_to_budget(
                 self._offload_gpu_max_entries, self.offload.could_serve
