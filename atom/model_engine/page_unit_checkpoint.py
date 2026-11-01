@@ -413,9 +413,9 @@ class PageUnitCheckpointStore:
         if max_entries <= 0 or len(self.records) <= max_entries:
             return
         # Superseded images first, then the rest; least recently used first in
-        # each. An image a live conversation will resume from is its newest,
-        # which nothing has superseded, so age alone does not release it while
-        # older generations of other conversations remain.
+        # each. The images a live conversation will resume from are its chain's
+        # root and tip, which nothing has superseded, so age alone does not
+        # release them while older generations of other conversations remain.
         for superseded_only in (True, False):
             for checkpoint_id in list(self._lru):
                 if len(self.records) <= max_entries:
@@ -428,17 +428,18 @@ class PageUnitCheckpointStore:
                 ):
                     self._evict(checkpoint_id)
 
-    def mark_superseded(self, prefix_hash: int) -> None:
+    def mark_superseded(self, prefix_hash: int, max_restores: int = 1) -> None:
         """Mark the image at `prefix_hash` as no longer a resume point.
 
-        Unless several conversations resume from it: a shared prefix's image
-        (the system prompt, say) stays an ordinary LRU candidate.
+        Unless more than `max_restores` requests resumed from it: a shared
+        prefix's image (the system prompt, say) stays an ordinary LRU candidate.
+        A later restore clears the mark (`begin_restore`).
         """
         checkpoint_id = self.lookup(prefix_hash)
         if checkpoint_id < 0:
             return
         record = self.records[checkpoint_id]
-        if record.restores <= 1:
+        if record.restores <= max_restores:
             record.superseded = True
 
     def restore_queued_for(self, dst_slot: int) -> bool:
@@ -454,6 +455,7 @@ class PageUnitCheckpointStore:
         record = self.records[checkpoint_id]
         record.pin_count += 1
         record.restores += 1
+        record.superseded = False  # resumed from, so still a resume point
         self._lru.move_to_end(checkpoint_id)
         op = CheckpointRestoreOp(
             dst_slot=dst_slot,
@@ -1013,11 +1015,27 @@ class PagedStateCheckpointCoordinator:
         # `resumable_hit` (the vote) and `take_offload_stores` (the sink).
         self.offload = offload
         self._offload_gpu_max_entries = 0
-        # Per live seq (by id): the last boundary it filed, and the image it
-        # resumed from. Both become superseded when the seq files a later
-        # boundary; dropped with the seq's slot (`forget_pending`).
+        # Per live seq (by id): the last boundary it filed, the image it
+        # resumed from, and whether that image already had a successor (the seq
+        # branched back rather than extending its conversation's newest image).
+        # Dropped with the seq's slot (`forget_pending`).
         self._seq_last_image: dict[int, int] = {}
         self._seq_resumed_from: dict[int, int] = {}
+        self._seq_branched: dict[int, bool] = {}
+        # Image chains. A chain is one conversation's run of strict extensions,
+        # each request resuming from the previous one's prompt-end image; only
+        # prompt-end images are members, and earlier boundaries stay standalone
+        # (see `checkpoint`). The
+        # newest image (the tip) is where the next request resumes. The first
+        # (the root) is kept too: a chat template that drops earlier reasoning
+        # once the next user message arrives (Qwen3.5's) rewrites every turn
+        # after the root, sending the conversation back to it. A request that
+        # resumes from an image which already has a successor has branched
+        # back; it roots a new chain, and the old root and tip are superseded.
+        # Everything in between is superseded as the chain extends.
+        self._has_child: set[int] = set()
+        self._chain_of: dict[int, int] = {}  # image -> its chain's root
+        self._chain_tip: dict[int, int] = {}  # root -> the chain's newest image
         # Decode-time boundaries filed but maybe not stored yet; marked
         # superseded once their image exists (`complete_previous_batch`).
         self._release_first: set[int] = set()
@@ -1034,13 +1052,12 @@ class PagedStateCheckpointCoordinator:
         self._trimming = False
         self.diag_released: dict[str, int] = {}
         self.diag_short: dict[str, list[int]] = {}
-        if self.diag:
-            self.store.on_evict = self._note_release
+        self.store.on_evict = self._on_release
         # GPU-only budget for the images (ATOM_STATE_CHECKPOINT_GPU_SIZE): past
         # it, `complete_previous_batch` releases the least recently used ones
-        # rather than letting them displace the prefix cache. A conversation
-        # resumes from its newest image, so the ones that age out are the
-        # superseded ones; a shared prefix's image stays recent by being hit.
+        # rather than letting them displace the prefix cache. Superseded images
+        # go first (see the image chains above); a shared prefix's image stays
+        # recent by being hit.
         self._gpu_max_entries = 0
         budget = envs.ATOM_STATE_CHECKPOINT_GPU_SIZE
         if enabled and budget:
@@ -1228,24 +1245,81 @@ class PagedStateCheckpointCoordinator:
             self._pending[(id(seq), h)] = (seq, h)
             pos = boundary_blocks * getattr(seq, "block_size", 0)
             if pos <= getattr(seq, "num_prompt_tokens", pos):
-                # A prompt boundary: the next turn resumes at this prompt's end,
-                # so this seq's earlier prompt boundaries, and the image it
-                # resumed from, are no longer where the conversation resumes.
-                for older in (
-                    self._seq_last_image.get(id(seq)),
-                    self._seq_resumed_from.pop(id(seq), None),
-                ):
-                    if older is not None and older != h:
-                        self.store.mark_superseded(older)
+                # A prompt boundary: the next turn resumes at this prompt's end.
+                prev = self._seq_last_image.get(id(seq))
+                if prev is None:
+                    self._link(id(seq), h)
+                elif prev != h:
+                    # This seq's own earlier prompt boundary, a rung or demand
+                    # boundary that other prefixes may share (a long system
+                    # prompt's): left standalone, an ordinary LRU candidate.
+                    # h takes its place in the chain.
+                    root = self._chain_of.pop(prev, None)
+                    if root is not None:
+                        if root == prev:
+                            self._chain_tip.pop(prev, None)
+                            root = h
+                        self._chain_of[h] = root
+                        self._chain_tip[root] = h
                 self._seq_last_image[id(seq)] = h
             else:
-                # A decode-time boundary supersedes nothing: the chat template
-                # rewrites this turn's tail when the next user turn is appended,
-                # so the next turn diverges before it and resumes at the
-                # prompt-end image. This image goes first under a budget.
+                # A decode-time boundary supersedes nothing and goes first under
+                # a budget: generated tokens reach a later prompt only when the
+                # client sends this output back verbatim and the template
+                # renders it unchanged, and a client replaying recorded turns
+                # never does.
                 self._release_first.add(h)
                 if self.diag:
                     self._decode_hashes.add(h)
+
+    def _link(self, seq_id: int, h: int) -> None:
+        """Place a seq's first prompt boundary `h` in its conversation's chain."""
+        parent = self._seq_resumed_from.pop(seq_id, None)
+        branched = self._seq_branched.pop(seq_id, True)
+        if parent == h:
+            # Resumed exactly where it files (a replay of the same prompt).
+            return
+        root = self._chain_of.get(parent) if parent is not None else None
+        if root is not None and not branched:
+            # Extends its chain: the parent was the tip, and h replaces it.
+            if parent != root:
+                self.store.mark_superseded(parent)
+            self._has_child.add(parent)
+            self._chain_of[h] = root
+            self._chain_tip[root] = h
+            return
+        if root is not None:
+            # Branched back into its own chain (with Qwen3.5's template, the
+            # next user message). The parent was resumed from twice when it is
+            # the old root: by the chain's second request and by this one.
+            self.store.mark_superseded(parent, max_restores=2)
+            for older in (root, self._chain_tip.get(root)):
+                if older is not None and older not in (h, parent):
+                    self.store.mark_superseded(older)
+        # A cold start, a branch-back, or a resume from a standalone image (a
+        # rung or demand boundary, which other prefixes may share and which is
+        # therefore never superseded): h roots a new chain.
+        self._chain_of[h] = h
+        self._chain_tip[h] = h
+
+    def _on_release(self, record: CheckpointRecord, unindexed: bool) -> None:
+        h = record.prefix_hash
+        self._has_child.discard(h)
+        root = self._chain_of.pop(h, None)
+        if root is not None and self._chain_tip.get(root) == h:
+            del self._chain_tip[root]
+        if self.diag:
+            self._note_release(record, unindexed)
+
+    def _prune_chains(self) -> None:
+        """Drop chain entries for boundaries that were filed but never stored."""
+        if len(self._chain_of) <= 4 * len(self.store.records) + 4096:
+            return
+        live = {r.prefix_hash for r in self.store.records.values()}
+        live.update(h for _sid, h in self._pending)
+        self._chain_of = {h: r for h, r in self._chain_of.items() if h in live}
+        self._chain_tip = {r: t for r, t in self._chain_tip.items() if t in live}
+        self._has_child &= live
 
     def _supersede(self, seq_id: int) -> None:
         """Drop this seq's earlier pending boundaries; the slot has moved on.
@@ -1270,6 +1344,7 @@ class PagedStateCheckpointCoordinator:
             del self._pending[key]
         self._seq_last_image.pop(seq_id, None)
         self._seq_resumed_from.pop(seq_id, None)
+        self._seq_branched.pop(seq_id, None)
         self.store.cancel_queued_restore(seq.state_slot)
 
     def restore_queued_for(self, dst_slot: int) -> bool:
@@ -1284,6 +1359,7 @@ class PagedStateCheckpointCoordinator:
         queued = self.store.begin_restore(h, dst_slot) is not None
         if queued and seq is not None:
             self._seq_resumed_from[id(seq)] = h
+            self._seq_branched[id(seq)] = h in self._has_child
         return queued
 
     def take_checkpoint_ops(
@@ -1367,6 +1443,7 @@ class PagedStateCheckpointCoordinator:
 
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
+        self._prune_chains()
         for h in list(self._release_first):
             if self.store.contains(h):
                 self.store.mark_superseded(h)
